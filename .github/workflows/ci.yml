@@ -1,0 +1,223 @@
+name: CI
+
+# Authored for the sealed build: upstream Kafka 3.5.0 has no GitHub Actions workflow
+# that builds or tests kafka-clients (its CI is the Jenkinsfile). This mirrors the
+# Jenkinsfile's test stages (JDK 8/11/17, maxParallelForks=2, maxTestRetries=1,
+# maxTestRetryFailures=10) for the :clients module, and builds the release jars on
+# JDK 8 (the toolchain release.py uses) with the release commit id.
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Gradle test task + selector (e.g. ":clients:test --tests FooTest"); empty runs the full :clients suite'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test kafka-clients (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        java: ["8", "11", "17"]
+    env:
+      # kafka-version.properties in the public jar carries commitId=c97b88d5db4de28d
+      # (the 3.5.0 release commit); the fork's HEAD is a different commit.
+      GRADLE_FLAGS: >-
+        --no-daemon --console=plain -PcommitId=c97b88d5db4de28d
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK ${{ matrix.java }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+
+      # Resolve the build's Gradle plugins/dependencies up front, retrying a
+      # transient repository error (a JDK 17 leg once got spurious "Could not find"
+      # 404s for spotless-plugin-gradle 6.14.0's dependencies from Central).
+      - name: Resolve Gradle plugins
+        run: |
+          for i in 1 2 3; do
+            ./gradlew help $GRADLE_FLAGS && exit 0
+            echo "plugin resolution failed (attempt $i), retrying in 30s"; sleep 30
+          done
+          exit 1
+
+      - name: Build kafka-clients jars
+        if: matrix.java == '8'
+        run: |
+          ./gradlew :clients:jar :clients:testJar $GRADLE_FLAGS
+          ls -l clients/build/libs/
+
+      - name: Write test summary init script
+        run: |
+          cat > "$RUNNER_TEMP/test-count.gradle" <<'INIT'
+          allprojects {
+              tasks.withType(Test) {
+                  afterSuite { desc, result ->
+                      if (desc.parent == null) {
+                          println("TEST SUMMARY [${project.path}]: ${result.testCount} tests, ${result.successfulTestCount} passed, ${result.failedTestCount} failed, ${result.skippedTestCount} skipped")
+                      }
+                  }
+              }
+          }
+          // build.gradle gives every test JVM a 2g heap (defaultMaxHeapSize). On the
+          // GitHub runners :clients:test intermittently exhausted it inside FetcherTest
+          // ("OutOfMemoryError: GC overhead limit exceeded"), killing the executor with
+          // the rest of its classes unrun. The cause, a Mockito spy recording every call
+          // of a busy loop, is fixed in FetcherTest; 4g is headroom for the 2 forks on
+          // the 16 GB runner.
+          gradle.projectsEvaluated {
+              rootProject.allprojects {
+                  tasks.withType(Test) { t ->
+                      t.maxHeapSize = "4g"
+                      t.doFirst { println("TEST JVM [${t.path}]: maxHeapSize=${t.maxHeapSize}, maxParallelForks=${t.maxParallelForks}") }
+                  }
+              }
+          }
+          INIT
+
+      # The test certificates TestSslUtils generates are signed SHA1withRSA. JDK
+      # updates from April 2025 (JDK-8340321: 11.0.27, 17.0.15) add
+      # rsa_pkcs1_sha1/ecdsa_sha1/dsa_sha1 "usage HandshakeSignature" to
+      # jdk.tls.disabledAlgorithms, so TLSv1.2 mutual-auth handshakes in
+      # SslTransportLayerTest fail with "Empty client certificate chain". Upstream
+      # moved TestSslUtils to SHA256withRSA later (apache/kafka 0810650da1bc), but
+      # TestSslUtils ships in kafka-clients-3.5.0-test.jar, so instead the test JVMs
+      # get the provider's own disabled list minus those SHA-1 entries (the
+      # release-era JDK default). No-op on a JDK without them (JDK 8 here).
+      - name: Restore release-era TLS 1.2 SHA-1 handshake signatures for tests
+        run: |
+          SEC="$JAVA_HOME/conf/security/java.security"
+          [ -f "$SEC" ] || SEC="$JAVA_HOME/jre/lib/security/java.security"
+          perl -0777 -ne 'if (/^jdk\.tls\.disabledAlgorithms=((?:[^\n]*\\\n)*[^\n]*)/m) { my $v = $1; $v =~ s/\\\n//g; my @e = grep { !/_sha1 usage HandshakeSignature/ } map { s/^\s+|\s+$//gr } split /,/, $v; print "jdk.tls.disabledAlgorithms=", join(", ", @e), "\n" }' "$SEC" > "$RUNNER_TEMP/tls.security"
+          echo "--- default:"; grep -A6 '^jdk.tls.disabledAlgorithms=' "$SEC"
+          echo "--- override:"; cat "$RUNNER_TEMP/tls.security"
+
+      - name: Test kafka-clients
+        timeout-minutes: 30
+        run: |
+          # Watchdog: a healthy leg finishes its tests in well under 10 minutes. If a
+          # test JVM is still running after 20, print its thread dump and GC state so
+          # a hang is diagnosable from the log (printed by the report step).
+          ( sleep 1200
+            for p in $(jps -l 2>/dev/null | awk '/GradleWorkerMain/{print $1}'); do
+              echo "=== WATCHDOG: test JVM $p still running after 20 min ==="
+              jstat -gcutil "$p" 2>&1; jstack "$p" 2>&1
+            done ) > "$RUNNER_TEMP/watchdog.log" 2>&1 &
+          export JAVA_TOOL_OPTIONS="-Djava.security.properties=$RUNNER_TEMP/tls.security"
+          TEST_FLAGS="$GRADLE_FLAGS -PmaxParallelForks=2 -PmaxTestRetries=1 -PmaxTestRetryFailures=10 -PtestLoggingEvents=started,passed,skipped,failed -I $RUNNER_TEMP/test-count.gradle"
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew ${{ inputs.test-filter }} $TEST_FLAGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          else
+            ./gradlew :generator:test :clients:test $TEST_FLAGS 2>&1 | tee "$RUNNER_TEMP/test.log"
+          fi
+
+      - name: Report skipped tests with reasons and test totals
+        if: always()
+        run: |
+          java -version 2>&1
+          # Gradle's console prints one "<Class> > <method>(...) [> <invocation>] SKIPPED"
+          # line per skipped test (-PtestLoggingEvents=failed,skipped). Its XML names
+          # parameterized invocations only by their display name ("[3] tlsProtocol=..."),
+          # so read the method from the console line and its reason from the source:
+          # @Disabled/@EnabledOnJre-style annotations, or an assume*() in the test body.
+          cat > "$RUNNER_TEMP/skip-reasons.pl" <<'PERL'
+          use strict; use warnings;
+          my ($log, @roots) = @ARGV;
+          my $ann = qr/^\s*(\@(?:Disabled|Enabled)\w*(?:\(.*?\))?.*)$/;
+          my %src;
+          sub srcfile { my $c = shift; return $src{$c} if exists $src{$c};
+            my $f = ''; for my $r (@roots) { my $o = `find $r -name '$c.java' | head -1`; chomp $o; if ($o) { $f = $o; last } }
+            return $src{$c} = $f }
+          sub reasons { my ($f, $cls, $meth) = @_; my @why;
+            open my $s, '<', $f or return ();
+            my @l = <$s>;
+            for my $i (0..$#l) {
+              next unless $l[$i] =~ /\bvoid\s+\Q$meth\E\s*\(/;
+              for (my $j = $i - 1; $j >= 0 && $l[$j] =~ /^\s*(\@|\/\/|\*|\/\*)/; $j--) { push @why, $1 if $l[$j] =~ $ann }
+              if (!@why) {
+                for (my $k = $i + 1; $k <= $#l && $k <= $i + 30 && $l[$k] !~ /^\s{4}\}/; $k++) {
+                  if ($l[$k] =~ /^\s*(assume\w*\(.*)$/) {
+                    my $a = "assumption not met: $1";
+                    $a .= " ($1)" if $l[$k-1] =~ /^\s*\/\/\s*(.*)$/;
+                    push @why, $a;
+                  }
+                }
+              }
+            }
+            if (!@why) {
+              for my $i (0..$#l) {
+                next unless $l[$i] =~ /\bclass\s+\Q$cls\E\b/;
+                for (my $j = $i - 1; $j >= 0 && $l[$j] =~ /^\s*(\@|\/\/)/; $j--) { push @why, $1 if $l[$j] =~ $ann }
+              }
+            }
+            s/\s+$// for @why; return @why }
+          my %seen;
+          open my $fh, '<', $log or die "no $log";
+          while (my $line = <$fh>) {
+            next unless $line =~ /Gradle Test Executor \d+ > (.+?) SKIPPED\s*$/;
+            my $what = $1; next if $seen{$what}++;
+            my @p = split / > /, $what;
+            my $cls = $p[0]; (my $meth = $p[1] // '') =~ s/[\(\[].*//;
+            my $f = srcfile($cls);
+            my @why = $f ? reasons($f, $cls, $meth) : ();
+            print "SKIPPED $what -- reason: ", (@why ? join(' ; ', @why) : 'no skip annotation or assumption found in source'), "\n";
+          }
+          print "(", scalar(keys %seen), " skipped test invocations)\n";
+          PERL
+          echo "=== SKIPPED TESTS (class > method -- reason) ==="
+          perl "$RUNNER_TEMP/skip-reasons.pl" "$RUNNER_TEMP/test.log" clients/src/test/java generator/src/test/java
+          # Gradle's test-retry plugin (-PmaxTestRetries) reruns a failed test and
+          # records every attempt as its own <testcase>; the afterSuite summary counts
+          # attempts. Reconcile per unique test: the last attempt is the final result.
+          cat > "$RUNNER_TEMP/retry-report.pl" <<'PERL'
+          use strict; use warnings;
+          my (%final, %failedonce, %body, @order);
+          for my $x (@ARGV) {
+            open my $fh, '<', $x or next; my $c = do { local $/; <$fh> };
+            while ($c =~ /<testcase name="([^"]*)" classname="([^"]*)"[^>]*?(?:\/>|>(.*?)<\/testcase>)/gs) {
+              my $k = "$2.$1"; my $b = defined $3 ? $3 : '';
+              my $st = ($b =~ /<(?:failure|error)\b/) ? 'F' : ($b =~ /<skipped\b/) ? 'S' : 'P';
+              push @order, $k unless exists $final{$k};
+              $failedonce{$k} = 1 if $st eq 'F';
+              $final{$k} = $st;
+              $body{$k} = $b if $st eq 'F';
+            }
+          }
+          my ($p, $f, $s, $r) = (0, 0, 0, 0);
+          for my $k (@order) {
+            my $st = $final{$k};
+            if ($st eq 'P') { $p++; if ($failedonce{$k}) { $r++; print "RETRIED: $k -- failed, then PASSED on a Gradle test-retry rerun\n" } }
+            elsif ($st eq 'S') { $s++ }
+            else { $f++; print "FAILED ON EVERY ATTEMPT: $k\n"; print map { "    | $_\n" } grep { length } (split /\n/, $body{$k})[0..40] }
+          }
+          printf "FINAL PER-TEST RESULT [:clients]: %d distinct (class, XML test name) keys, %d passed (%d of them only after a retry), %d failed, %d skipped\n", scalar(@order), $p, $r, $f, $s;
+          exit($f ? 1 : 0);
+          PERL
+          echo "=== RETRY RECONCILIATION (unique tests, last attempt wins) ==="
+          # A test (or a test executor) still failing on its last attempt fails this step.
+          RC=0; perl "$RUNNER_TEMP/retry-report.pl" clients/build/test-results/test/*.xml || RC=$?
+          # A test JVM that dies (crash / OOM-kill) leaves an hs_err file behind.
+          for f in $(find clients generator -maxdepth 2 -name 'hs_err_pid*.log' 2>/dev/null); do echo "=== $f ==="; head -60 "$f"; done
+          [ -s "$RUNNER_TEMP/watchdog.log" ] && cat "$RUNNER_TEMP/watchdog.log"
+          echo "=== TEST TOTALS (Gradle afterSuite, counts every attempt incl. retries) ==="
+          grep "TEST SUMMARY" "$RUNNER_TEMP/test.log"
+          exit $RC
+
+      - name: Upload kafka-clients jars
+        if: matrix.java == '8'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-clients-jars
+          path: clients/build/libs/kafka-clients-*.jar
+          if-no-files-found: error

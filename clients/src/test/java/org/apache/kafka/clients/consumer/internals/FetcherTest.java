@@ -136,6 +136,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -2942,6 +2943,12 @@ public class FetcherTest {
         Map<TopicPartition, Long> nextFetchOffsets = topicPartitions.stream()
                 .collect(Collectors.toMap(Function.identity(), t -> 0L));
         while (fetchesRemaining.get() > 0 && !future.isDone()) {
+            // consumerClient is a Mockito spy, which records every call; this loop spins until the
+            // responder thread catches up, so on a slow scheduler the record grows without bound
+            // and exhausts the test JVM heap. This test never verifies the spy, so drop the record.
+            synchronized (consumerClient) {
+                clearInvocations(consumerClient);
+            }
             if (sendFetches() == 1) {
                 synchronized (consumerClient) {
                     consumerClient.poll(time.timer(0));
@@ -3004,6 +3011,12 @@ public class FetcherTest {
         });
         long nextFetchOffset = 0;
         while (fetchesRemaining.get() > 0 && !future.isDone()) {
+            // consumerClient is a Mockito spy, which records every call; this loop spins until the
+            // responder thread catches up, so on a slow scheduler the record grows without bound
+            // and exhausts the test JVM heap. This test never verifies the spy, so drop the record.
+            synchronized (consumerClient) {
+                clearInvocations(consumerClient);
+            }
             if (sendFetches() == 1) {
                 synchronized (consumerClient) {
                     consumerClient.poll(time.timer(0));
